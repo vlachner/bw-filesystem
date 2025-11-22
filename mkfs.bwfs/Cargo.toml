@@ -1,0 +1,12 @@
+[package]
+name = "mkfs_bwfs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+configparser = "3"
+
+[[bin]]
+name = "bwfs_info"
+path = "src/info_main.rs"
