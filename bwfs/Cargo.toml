@@ -1,0 +1,29 @@
+[package]
+name = "bwfs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "bwfs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mkfs_bwfs"
+path = "src/bin/mkfs_main.rs"
+
+[[bin]]
+name = "mount_bwfs"
+path = "src/bin/mount_main.rs"
+
+[[bin]]
+name = "bwfs_info"
+path = "src/bin/info_main.rs"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+configparser = "3.0"
+fuser = "0.14"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.8"
