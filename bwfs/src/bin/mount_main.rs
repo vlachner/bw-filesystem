@@ -46,7 +46,7 @@ fn main() {
         fuser::MountOption::RO,
     ];
 
-    let fs = fuse_impl::BwfsFilesystem::new(&image_path);
+    let fs = fuse_impl::BWFS::mount(&image_path);
 
     println!("Mounting... (Press Ctrl+C to unmount)");
     
