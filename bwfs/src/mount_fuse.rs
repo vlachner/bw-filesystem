@@ -13,26 +13,31 @@ use libc::ENOENT;
 
 use bwfs::fs_layout::*;
 
+// Tiempo de vida para atributos de archivos en caché
 const TTL: std::time::Duration = std::time::Duration::from_secs(1);
 
+// Verifica si el bit en la posición idx está activo en el bitmap
 pub fn test_bit(bm: &[u8], idx: u64) -> bool {
     let b = (idx / 8) as usize;
     let i = (idx % 8) as u8;
     bm[b] & (1 << i) != 0
 }
 
+// Establece el bit en la posición idx en el bitmap
 pub fn set_bit(bm: &mut [u8], idx: u64) {
     let b = (idx / 8) as usize;
     let i = (idx % 8) as u8;
     bm[b] |= 1 << i;
 }
 
+// Limpia el bit en la posición idx en el bitmap
 pub fn clear_bit(bm: &mut [u8], idx: u64) {
     let b = (idx / 8) as usize;
     let i = (idx % 8) as u8;
     bm[b] &= !(1 << i);
 }
 
+// Escribe una entrada de directorio en el inodo de directorio especificado
 fn write_dir_entry(fs: &mut FilesystemState, dir: u64, entry: DirEntry) {
     let block_size = fs.superblock.block_size;
     let entry_size = std::mem::size_of::<DirEntry>();
@@ -73,6 +78,7 @@ fn write_dir_entry(fs: &mut FilesystemState, dir: u64, entry: DirEntry) {
     panic!("Directory is full");
 }
 
+// Elimina una entrada de directorio por nombre y retorna su número de inodo
 fn remove_dir_entry(fs: &mut FilesystemState, dir: u64, name: &str) -> u64 {
     let inode = &mut fs.inodes[dir as usize];
 
@@ -104,6 +110,7 @@ fn remove_dir_entry(fs: &mut FilesystemState, dir: u64, name: &str) -> u64 {
     panic!("File not found");
 }
 
+// Estado del sistema de archivos que mantiene el superbloque, bitmaps e inodos en memoria
 pub struct FilesystemState {
     pub file: std::fs::File,
     pub superblock: Superblock,
@@ -112,18 +119,22 @@ pub struct FilesystemState {
     pub inodes: Vec<Inode>,
 }
 
+// Implementación del sistema de archivos BWFS con estado protegido por mutex
 pub struct BWFS {
     state: Mutex<FilesystemState>,
 }
 
+// Retorna la hora actual del sistema
 fn now() -> SystemTime {
     SystemTime::now()
 }
 
+// Calcula el offset en disco del inodo especificado
 fn inode_offset(sb: &Superblock, ino: u64) -> u64 {
     sb.inode_table_start + ino * std::mem::size_of::<Inode>() as u64
 }
 
+// Calcula el offset en disco del bloque de datos especificado
 fn block_offset(sb: &Superblock, block: u64) -> u64 {
     sb.data_area_start + block * sb.block_size
 }
@@ -131,6 +142,7 @@ fn block_offset(sb: &Superblock, block: u64) -> u64 {
 /* ---------------- DISK IO ---------------- */
 
 impl FilesystemState {
+    // Persiste un inodo en disco
     fn persist_inode(&mut self, ino: u64) {
         let off = inode_offset(&self.superblock, ino);
         self.file.seek(SeekFrom::Start(off)).unwrap();
@@ -139,6 +151,7 @@ impl FilesystemState {
             .unwrap();
     }
 
+    // Persiste el bitmap de inodos en disco
     fn persist_inode_bitmap(&mut self) {
         self.file
             .seek(SeekFrom::Start(self.superblock.inode_bitmap_start))
@@ -146,6 +159,7 @@ impl FilesystemState {
         self.file.write_all(&self.inode_bitmap).unwrap();
     }
 
+    // Persiste el bitmap de bloques en disco
     fn persist_block_bitmap(&mut self) {
         self.file
             .seek(SeekFrom::Start(self.superblock.block_bitmap_start))
@@ -153,6 +167,7 @@ impl FilesystemState {
         self.file.write_all(&self.block_bitmap).unwrap();
     }
 
+    // Asigna un inodo libre y lo marca como usado
     fn alloc_inode(&mut self) -> u64 {
         for i in 0..self.superblock.inode_count {
             if !test_bit(&self.inode_bitmap, i) {
@@ -164,8 +179,8 @@ impl FilesystemState {
         panic!("No free inodes");
     }
 
+    // Asigna un bloque libre y lo marca como usado (bloque 0 está reservado)
     fn alloc_block(&mut self) -> u64 {
-        // block 0 is reserved → treat 0 as "no block" in inodes
         for i in 1..self.superblock.total_blocks {
             if !test_bit(&self.block_bitmap, i) {
                 set_bit(&mut self.block_bitmap, i);
@@ -176,11 +191,13 @@ impl FilesystemState {
         panic!("Disk full");
     }
 
+    // Libera un inodo y lo marca como disponible
     fn free_inode(&mut self, ino: u64) {
         clear_bit(&mut self.inode_bitmap, ino);
         self.persist_inode_bitmap();
     }
 
+    // Libera un bloque y lo marca como disponible
     fn free_block(&mut self, blk: u64) {
         clear_bit(&mut self.block_bitmap, blk);
         self.persist_block_bitmap();
@@ -190,6 +207,7 @@ impl FilesystemState {
 /* ---------------- MOUNT ---------------- */
 
 impl BWFS {
+    // Monta una imagen de sistema de archivos BWFS desde disco
     pub fn mount(image: &str) -> Self {
         let mut file = OpenOptions::new()
             .read(true)
@@ -241,6 +259,7 @@ impl BWFS {
         }
     }
 
+    // Convierte un inodo a atributos de archivo FUSE
     fn getattr_inode(ino: u64, inode: &Inode) -> FileAttr {
         FileAttr {
             ino,
@@ -255,9 +274,6 @@ impl BWFS {
             } else {
                 FileType::RegularFile
             },
-            // perm: (inode.mode & 0o7777) as u16,
-            // uid: 1000,
-            // gid: 1000,
             nlink: 1,
             perm: 0o777,
             uid: 0,
@@ -272,10 +288,10 @@ impl BWFS {
 /* ---------------- FUSE OPS ---------------- */
 
 impl Filesystem for BWFS {
+    // Obtiene los atributos de un archivo o directorio
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         let st = self.state.lock().unwrap();
 
-        // Debug print
         let inode = &st.inodes[ino as usize];
         println!(
             "getattr(ino = {}): mode={:o}, size={}, direct={:?}",
@@ -289,6 +305,7 @@ impl Filesystem for BWFS {
         reply.attr(&TTL, &BWFS::getattr_inode(ino, inode));
     }
 
+    // Crea un nodo de archivo (archivo regular)
     fn mknod(
         &mut self,
         _req: &Request<'_>,
@@ -313,7 +330,7 @@ impl Filesystem for BWFS {
         let ino = st.alloc_inode();
 
         let mut inode = Inode::empty();
-        inode.mode = (mode | 0o100000) as u16; // regular file
+        inode.mode = (mode | 0o100000) as u16;
         inode.size = 0;
 
         st.inodes[ino as usize] = inode;
@@ -326,6 +343,7 @@ impl Filesystem for BWFS {
         reply.entry(&TTL, &attr, 0);
     }
 
+    // Crea un nuevo directorio
     fn mkdir(
         &mut self,
         _req: &Request<'_>,
@@ -348,6 +366,7 @@ impl Filesystem for BWFS {
         reply.entry(&TTL, &BWFS::getattr_inode(ino, &inode), 0);
     }
 
+    // Lee el contenido de un directorio
     fn readdir(
         &mut self,
         _req: &Request<'_>,
@@ -370,14 +389,14 @@ impl Filesystem for BWFS {
             return reply.error(libc::ENOTDIR);
         }
 
-        // Emit "."
+        // Emite "."
         if offset == 0 {
             if reply.add(ino, 1, FileType::Directory, ".") {
                 return;
             }
         }
 
-        // Emit ".."
+        // Emite ".."
         if offset <= 1 {
             let parent = if ino == 1 { 1 } else { 1 };
             if reply.add(parent, 2, FileType::Directory, "..") {
@@ -385,7 +404,7 @@ impl Filesystem for BWFS {
             }
         }
 
-        // Load directory block
+        // Carga el bloque del directorio
         let blk = inode.direct[0];
         if blk == 0 {
             return reply.ok();
@@ -399,13 +418,13 @@ impl Filesystem for BWFS {
 
         let entry_size = std::mem::size_of::<DirEntry>();
 
-        let mut idx = 2; // after "." and ".."
+        let mut idx = 2; // después de "." y ".."
 
         for chunk in buf.chunks_exact(entry_size) {
             let d: DirEntry = unsafe { std::ptr::read(chunk.as_ptr() as *const _) };
 
             if d.inode == 0 {
-                break; // IMPORTANT: stop at first free slot
+                break; // detiene en la primera ranura libre
             }
 
             let name = std::str::from_utf8(&d.name[..d.name_len as usize]).unwrap();
@@ -429,6 +448,7 @@ impl Filesystem for BWFS {
         reply.ok();
     }
 
+    // Crea y abre un archivo
     fn create(
         &mut self,
         _req: &Request<'_>,
@@ -452,6 +472,7 @@ impl Filesystem for BWFS {
         reply.created(&TTL, &BWFS::getattr_inode(ino, &inode), 0, 0, 0);
     }
 
+    // Lee datos de un archivo
     fn read(
         &mut self,
         _req: &Request<'_>,
@@ -466,7 +487,7 @@ impl Filesystem for BWFS {
         let mut st = self.state.lock().unwrap();
 
         let inode = &st.inodes[ino as usize];
-        let direct_blocks = inode.direct; // IMPORTANT: copy block list to avoid borrow conflict
+        let direct_blocks = inode.direct; // copia la lista de bloques para evitar conflicto de préstamo
 
         let block_size = st.superblock.block_size as usize;
         let mut buf = vec![0u8; size as usize];
@@ -475,7 +496,7 @@ impl Filesystem for BWFS {
         let mut global_off = offset as usize;
         let mut copied = 0usize;
 
-        // Iterate using copied block list (not borrowing st)
+        // Itera usando la lista copiada de bloques
         for (block_i, blk) in direct_blocks.iter().enumerate() {
             if *blk == 0 {
                 continue;
@@ -490,7 +511,6 @@ impl Filesystem for BWFS {
 
             let blk_off = global_off.saturating_sub(block_start);
 
-            // Now we can safely borrow st mutably
             let disk_offset =
                 st.superblock.data_area_start + (*blk as u64) * st.superblock.block_size;
             st.file.seek(SeekFrom::Start(disk_offset)).unwrap();
@@ -515,6 +535,7 @@ impl Filesystem for BWFS {
         reply.data(&buf[..copied]);
     }
 
+    // Escribe datos en un archivo
     fn write(
         &mut self,
         _req: &Request<'_>,
@@ -566,6 +587,7 @@ impl Filesystem for BWFS {
         reply.written(written as u32);
     }
 
+    // Elimina un archivo del sistema de archivos
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let mut st = self.state.lock().unwrap();
         let ino = remove_dir_entry(&mut st, parent, name.to_str().unwrap());
@@ -581,6 +603,7 @@ impl Filesystem for BWFS {
         reply.ok();
     }
 
+    // Retorna estadísticas del sistema de archivos
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
         let st = self.state.lock().unwrap();
 
@@ -599,6 +622,7 @@ impl Filesystem for BWFS {
         );
     }
 
+    // Renombra o mueve un archivo o directorio
     fn rename(
         &mut self,
         _req: &Request<'_>,
@@ -619,6 +643,7 @@ impl Filesystem for BWFS {
         reply.ok();
     }
 
+    // Busca un archivo o directorio por nombre en el directorio padre
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         println!("lookup(parent = {}, name = {:?})", parent, name);
 
@@ -626,31 +651,31 @@ impl Filesystem for BWFS {
         let name_bytes = name.as_bytes();
         let entry_size = std::mem::size_of::<DirEntry>();
 
-        // Validate parent inode
+        // Valida el inodo padre
         if parent as usize >= st.inodes.len() {
             return reply.error(libc::ENOENT);
         }
         let parent_inode = &st.inodes[parent as usize];
 
-        // "." → the parent itself
+        // "." → el padre mismo
         if name_bytes == b"." {
             let attr = BWFS::getattr_inode(parent, parent_inode);
             return reply.entry(&TTL, &attr, 0);
         }
 
-        // ".." → parent of root is root
+        // ".." → padre de raíz es raíz
         if name_bytes == b".." && parent == 1 {
             let inode = &st.inodes[1];
             let attr = BWFS::getattr_inode(1, inode);
             return reply.entry(&TTL, &attr, 0);
         }
 
-        // Must be directory
+        // Debe ser directorio
         if parent_inode.mode & 0o040000 == 0 {
             return reply.error(libc::ENOTDIR);
         }
 
-        // Load directory block
+        // Carga el bloque del directorio
         let blk = parent_inode.direct[0];
         if blk == 0 {
             return reply.error(libc::ENOENT);
@@ -661,12 +686,12 @@ impl Filesystem for BWFS {
         st.file.seek(SeekFrom::Start(block_off)).unwrap();
         st.file.read_exact(&mut buf).unwrap();
 
-        // SCAN REAL DIR ENTRIES — STOP AT FIRST FREE ENTRY
+        // Escanea entradas reales del directorio y detiene en la primera entrada libre
         for chunk in buf.chunks_exact(entry_size) {
             let d: DirEntry = unsafe { std::ptr::read(chunk.as_ptr() as *const _) };
 
             if d.inode == 0 {
-                break; // IMPORTANT: rest of block is padding
+                break; // resto del bloque es relleno
             }
 
             let dname = &d.name[..d.name_len as usize];
@@ -682,15 +707,19 @@ impl Filesystem for BWFS {
         reply.error(libc::ENOENT);
     }
 
+    // Verifica permisos de acceso a un archivo
     fn access(&mut self, _req: &Request<'_>, _: u64, _: i32, reply: ReplyEmpty) {
         reply.ok()
     }
+    // Vacía el buffer de escritura de un archivo
     fn flush(&mut self, _req: &Request<'_>, _: u64, _: u64, _: u64, reply: ReplyEmpty) {
         reply.ok()
     }
+    // Sincroniza los datos del archivo con el disco
     fn fsync(&mut self, _req: &Request<'_>, _: u64, _: u64, _: bool, reply: ReplyEmpty) {
         reply.ok()
     }
+    // Cambia la posición de lectura/escritura en un archivo
     fn lseek(
         &mut self,
         _req: &Request<'_>,
@@ -702,6 +731,7 @@ impl Filesystem for BWFS {
     ) {
         reply.offset(offset);
     }
+    // Abre un archivo para lectura o escritura
     fn open(&mut self, _req: &Request<'_>, _: u64, _: i32, reply: ReplyOpen) {
         reply.opened(0, 0)
     }
