@@ -21,6 +21,7 @@ struct Cli {
     out: String,
 }
 
+// Lee el superblock desde el inicio del archivo del sistema de archivos
 fn read_superblock(file: &mut File) -> Superblock {
     let mut buf = [0u8; std::mem::size_of::<Superblock>()];
     file.seek(SeekFrom::Start(0)).unwrap();
@@ -28,6 +29,7 @@ fn read_superblock(file: &mut File) -> Superblock {
     unsafe { std::ptr::read(buf.as_ptr() as *const Superblock) }
 }
 
+// Lee la tabla completa de inodos desde disco y la devuelve como un vector
 fn read_inode_table(file: &mut File, sb: &Superblock) -> Vec<Inode> {
     let mut v = Vec::new();
     let inode_size = std::mem::size_of::<Inode>();
@@ -42,6 +44,7 @@ fn read_inode_table(file: &mut File, sb: &Superblock) -> Vec<Inode> {
     v
 }
 
+// Lee todas las entradas de directorio de un inodo de tipo directorio
 fn read_directory_entries(file: &mut File, sb: &Superblock, inode: &Inode) -> Vec<DirEntry> {
     let mut out = Vec::new();
     let block_size = sb.block_size as usize;
@@ -67,6 +70,7 @@ fn read_directory_entries(file: &mut File, sb: &Superblock, inode: &Inode) -> Ve
     out
 }
 
+// Construye un mapa que asocia número de inodo con nombre de archivo a partir del directorio raíz
 fn build_inode_to_name_map(
     file: &mut File,
     sb: &Superblock,
@@ -74,7 +78,6 @@ fn build_inode_to_name_map(
 ) -> HashMap<u64, String> {
     let mut map = HashMap::new();
 
-    // We only walk root (inode 1) for now
     let root = &inodes[1];
     let entries = read_directory_entries(file, sb, root);
 
@@ -88,6 +91,7 @@ fn build_inode_to_name_map(
     map
 }
 
+// Extrae un bloque de datos y lo guarda como imagen PNG en escala de grises
 fn dump_png(
     file: &mut File,
     sb: &Superblock,
@@ -104,7 +108,6 @@ fn dump_png(
     file.seek(SeekFrom::Start(disk_offset)).unwrap();
     file.read_exact(&mut raw).unwrap();
 
-    // sanitize filename
     let safe = name.replace("/", "_");
 
     let png_path = format!(
@@ -125,6 +128,7 @@ fn dump_png(
     println!("dumped {}", png_path);
 }
 
+// Orquesta la lectura del sistema de archivos y el volcado de bloques a imágenes PNG
 fn main() {
     let args = Cli::parse();
     let image_path = args.image;
@@ -145,7 +149,6 @@ fn main() {
 
     println!("loaded BWFS image: block size = {}", sb.block_size);
 
-    // map inode → file name
     let name_map = build_inode_to_name_map(&mut file, &sb, &inodes);
 
     for (ino, inode) in inodes.iter().enumerate() {
