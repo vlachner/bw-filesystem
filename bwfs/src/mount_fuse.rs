@@ -6,6 +6,8 @@ use std::{
     time::SystemTime,
 };
 
+use std::os::unix::ffi::OsStrExt;
+
 use fuser::*;
 use libc::ENOENT;
 
@@ -75,7 +77,9 @@ fn remove_dir_entry(fs: &mut FilesystemState, dir: u64, name: &str) -> u64 {
     let inode = &mut fs.inodes[dir as usize];
 
     for &blk in inode.direct.iter() {
-        if blk == 0 { continue; }
+        if blk == 0 {
+            continue;
+        }
         let off = block_offset(&fs.superblock, blk);
         fs.file.seek(SeekFrom::Start(off)).unwrap();
 
@@ -130,16 +134,22 @@ impl FilesystemState {
     fn persist_inode(&mut self, ino: u64) {
         let off = inode_offset(&self.superblock, ino);
         self.file.seek(SeekFrom::Start(off)).unwrap();
-        self.file.write_all(&to_bytes(&self.inodes[ino as usize])).unwrap();
+        self.file
+            .write_all(&to_bytes(&self.inodes[ino as usize]))
+            .unwrap();
     }
 
     fn persist_inode_bitmap(&mut self) {
-        self.file.seek(SeekFrom::Start(self.superblock.inode_bitmap_start)).unwrap();
+        self.file
+            .seek(SeekFrom::Start(self.superblock.inode_bitmap_start))
+            .unwrap();
         self.file.write_all(&self.inode_bitmap).unwrap();
     }
 
     fn persist_block_bitmap(&mut self) {
-        self.file.seek(SeekFrom::Start(self.superblock.block_bitmap_start)).unwrap();
+        self.file
+            .seek(SeekFrom::Start(self.superblock.block_bitmap_start))
+            .unwrap();
         self.file.write_all(&self.block_bitmap).unwrap();
     }
 
@@ -155,7 +165,8 @@ impl FilesystemState {
     }
 
     fn alloc_block(&mut self) -> u64 {
-        for i in 0..self.superblock.total_blocks {
+        // block 0 is reserved → treat 0 as "no block" in inodes
+        for i in 1..self.superblock.total_blocks {
             if !test_bit(&self.block_bitmap, i) {
                 set_bit(&mut self.block_bitmap, i);
                 self.persist_block_bitmap();
@@ -189,7 +200,11 @@ impl BWFS {
         let mut sb = std::mem::MaybeUninit::<Superblock>::uninit();
         unsafe {
             let p = sb.as_mut_ptr() as *mut u8;
-            file.read_exact(std::slice::from_raw_parts_mut(p, std::mem::size_of::<Superblock>())).unwrap();
+            file.read_exact(std::slice::from_raw_parts_mut(
+                p,
+                std::mem::size_of::<Superblock>(),
+            ))
+            .unwrap();
         }
         let sb = unsafe { sb.assume_init() };
 
@@ -222,7 +237,7 @@ impl BWFS {
                 inode_bitmap,
                 block_bitmap,
                 inodes,
-            })
+            }),
         }
     }
 
@@ -235,11 +250,18 @@ impl BWFS {
             mtime: now(),
             ctime: now(),
             crtime: now(),
-            kind: if inode.mode & 0o040000 != 0 { FileType::Directory } else { FileType::RegularFile },
-            perm: (inode.mode & 0o7777) as u16,
+            kind: if inode.mode & 0o040000 != 0 {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            },
+            // perm: (inode.mode & 0o7777) as u16,
+            // uid: 1000,
+            // gid: 1000,
             nlink: 1,
-            uid: 1000,
-            gid: 1000,
+            perm: 0o777,
+            uid: 0,
+            gid: 0,
             rdev: 0,
             flags: 0,
             blksize: 512,
@@ -252,8 +274,56 @@ impl BWFS {
 impl Filesystem for BWFS {
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         let st = self.state.lock().unwrap();
-        if ino >= st.inodes.len() as u64 { return reply.error(ENOENT); }
-        reply.attr(&TTL, &BWFS::getattr_inode(ino, &st.inodes[ino as usize]));
+
+        // Debug print
+        let inode = &st.inodes[ino as usize];
+        println!(
+            "getattr(ino = {}): mode={:o}, size={}, direct={:?}",
+            ino, inode.mode, inode.size, inode.direct,
+        );
+
+        if ino >= st.inodes.len() as u64 {
+            return reply.error(ENOENT);
+        }
+
+        reply.attr(&TTL, &BWFS::getattr_inode(ino, inode));
+    }
+
+    fn mknod(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        println!(
+            "mknod(parent = {}, name = {:?}, mode = {:o}, rdev = {}, umask = {})",
+            parent, name, mode, rdev, umask
+        );
+
+        let mut st = self.state.lock().unwrap();
+
+        if parent as usize >= st.inodes.len() {
+            return reply.error(libc::ENOENT);
+        }
+
+        let ino = st.alloc_inode();
+
+        let mut inode = Inode::empty();
+        inode.mode = (mode | 0o100000) as u16; // regular file
+        inode.size = 0;
+
+        st.inodes[ino as usize] = inode;
+        st.persist_inode(ino);
+
+        let entry = DirEntry::new(ino, name.to_str().unwrap(), false);
+        write_dir_entry(&mut st, parent, entry);
+
+        let attr = BWFS::getattr_inode(ino, &st.inodes[ino as usize]);
+        reply.entry(&TTL, &attr, 0);
     }
 
     fn mkdir(
@@ -263,7 +333,7 @@ impl Filesystem for BWFS {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        reply: ReplyEntry
+        reply: ReplyEntry,
     ) {
         let mut st = self.state.lock().unwrap();
         let ino = st.alloc_inode();
@@ -278,6 +348,87 @@ impl Filesystem for BWFS {
         reply.entry(&TTL, &BWFS::getattr_inode(ino, &inode), 0);
     }
 
+    fn readdir(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        println!("readdir(ino = {}, offset = {})", ino, offset);
+
+        let mut st = self.state.lock().unwrap();
+
+        if ino as usize >= st.inodes.len() {
+            return reply.error(libc::ENOENT);
+        }
+
+        let inode = &st.inodes[ino as usize];
+
+        if inode.mode & 0o040000 == 0 {
+            return reply.error(libc::ENOTDIR);
+        }
+
+        // Emit "."
+        if offset == 0 {
+            if reply.add(ino, 1, FileType::Directory, ".") {
+                return;
+            }
+        }
+
+        // Emit ".."
+        if offset <= 1 {
+            let parent = if ino == 1 { 1 } else { 1 };
+            if reply.add(parent, 2, FileType::Directory, "..") {
+                return;
+            }
+        }
+
+        // Load directory block
+        let blk = inode.direct[0];
+        if blk == 0 {
+            return reply.ok();
+        }
+
+        let block_off = block_offset(&st.superblock, blk);
+        let mut buf = vec![0u8; st.superblock.block_size as usize];
+
+        st.file.seek(SeekFrom::Start(block_off)).unwrap();
+        st.file.read_exact(&mut buf).unwrap();
+
+        let entry_size = std::mem::size_of::<DirEntry>();
+
+        let mut idx = 2; // after "." and ".."
+
+        for chunk in buf.chunks_exact(entry_size) {
+            let d: DirEntry = unsafe { std::ptr::read(chunk.as_ptr() as *const _) };
+
+            if d.inode == 0 {
+                break; // IMPORTANT: stop at first free slot
+            }
+
+            let name = std::str::from_utf8(&d.name[..d.name_len as usize]).unwrap();
+            let child = &st.inodes[d.inode as usize];
+
+            let ftyp = if child.mode & 0o040000 != 0 {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+
+            if idx >= offset {
+                if reply.add(d.inode, idx as i64 + 1, ftyp, name) {
+                    return;
+                }
+            }
+
+            idx += 1;
+        }
+
+        reply.ok();
+    }
+
     fn create(
         &mut self,
         _req: &Request<'_>,
@@ -286,9 +437,8 @@ impl Filesystem for BWFS {
         mode: u32,
         _umask: u32,
         _flags: i32,
-        reply: ReplyCreate
-    )
- {
+        reply: ReplyCreate,
+    ) {
         let mut st = self.state.lock().unwrap();
         let ino = st.alloc_inode();
 
@@ -311,28 +461,55 @@ impl Filesystem for BWFS {
         size: u32,
         _flags: i32,
         _lock: Option<u64>,
-        reply: ReplyData
+        reply: ReplyData,
     ) {
         let mut st = self.state.lock().unwrap();
-        let inode = &st.inodes[ino as usize];
-        let mut buf = vec![0; size as usize];
-        let mut pos = offset as usize;
 
-        let mut copied = 0;
-        for blk in inode.direct {
-            if blk == 0 { continue; }
-            let base = block_offset(&st.superblock, blk);
-            st.file.seek(SeekFrom::Start(base)).unwrap();
-            let mut block = vec![0; st.superblock.block_size as usize];
+        let inode = &st.inodes[ino as usize];
+        let direct_blocks = inode.direct; // IMPORTANT: copy block list to avoid borrow conflict
+
+        let block_size = st.superblock.block_size as usize;
+        let mut buf = vec![0u8; size as usize];
+
+        let mut remaining = size as usize;
+        let mut global_off = offset as usize;
+        let mut copied = 0usize;
+
+        // Iterate using copied block list (not borrowing st)
+        for (block_i, blk) in direct_blocks.iter().enumerate() {
+            if *blk == 0 {
+                continue;
+            }
+
+            let block_start = block_i * block_size;
+            let block_end = block_start + block_size;
+
+            if global_off >= block_end {
+                continue;
+            }
+
+            let blk_off = global_off.saturating_sub(block_start);
+
+            // Now we can safely borrow st mutably
+            let disk_offset =
+                st.superblock.data_area_start + (*blk as u64) * st.superblock.block_size;
+            st.file.seek(SeekFrom::Start(disk_offset)).unwrap();
+
+            let mut block = vec![0u8; block_size];
             st.file.read_exact(&mut block).unwrap();
 
-            let take = std::cmp::min(size as usize - copied, block.len());
-            if pos < block.len() {
-                buf[copied..copied+take].copy_from_slice(&block[pos..pos+take]);
-                copied += take;
+            let available = block_size - blk_off;
+            let take = available.min(remaining);
+
+            buf[copied..copied + take].copy_from_slice(&block[blk_off..blk_off + take]);
+
+            copied += take;
+            remaining -= take;
+            global_off += take;
+
+            if remaining == 0 {
+                break;
             }
-            pos = pos.saturating_sub(block.len());
-            if copied >= size as usize { break; }
         }
 
         reply.data(&buf[..copied]);
@@ -348,46 +525,45 @@ impl Filesystem for BWFS {
         _write_flags: u32,
         _flags: i32,
         _lock: Option<u64>,
-        reply: ReplyWrite
+        reply: ReplyWrite,
     ) {
         let mut st = self.state.lock().unwrap();
+        let block_size = st.superblock.block_size as u64;
 
-        let block_size = st.superblock.block_size;
+        let mut written = 0usize;
+        let mut off = offset as u64;
 
-        let mut remaining = data;
-        let mut file_offset = offset as u64;
+        while written < data.len() {
+            let blk_index = (off / block_size) as usize;
+            if blk_index >= 12 {
+                break;
+            }
 
-        for i in 0..12 {
-            if remaining.is_empty() { break; }
+            if st.inodes[ino as usize].direct[blk_index] == 0 {
+                st.inodes[ino as usize].direct[blk_index] = st.alloc_block();
+            }
 
-            let blk = {
-                let blk = st.inodes[ino as usize].direct[i];
-                if blk == 0 {
-                    let new = st.alloc_block();
-                    st.inodes[ino as usize].direct[i] = new;
-                    new
-                } else {
-                    blk
-                }
-            };
+            let blk = st.inodes[ino as usize].direct[blk_index];
+            let blk_offset = st.superblock.data_area_start + blk * block_size;
 
-            let blk_off = st.superblock.data_area_start + blk * block_size;
+            let inside = (off % block_size) as usize;
+            let space = block_size as usize - inside;
+            let chunk = space.min(data.len() - written);
 
-            let write_at = file_offset.min(block_size);
-            let writable = (block_size - write_at).min(remaining.len() as u64) as usize;
+            st.file
+                .seek(SeekFrom::Start(blk_offset + inside as u64))
+                .unwrap();
+            st.file.write_all(&data[written..written + chunk]).unwrap();
 
-            st.file.seek(SeekFrom::Start(blk_off + write_at)).unwrap();
-            st.file.write_all(&remaining[..writable]).unwrap();
-
-            remaining = &remaining[writable..];
-            file_offset = file_offset.saturating_sub(block_size);
+            off += chunk as u64;
+            written += chunk;
         }
 
-        let new_size = (offset as u64 + data.len() as u64).max(st.inodes[ino as usize].size);
-        st.inodes[ino as usize].size = new_size;
+        let inode = &mut st.inodes[ino as usize];
+        inode.size = inode.size.max(offset as u64 + data.len() as u64);
         st.persist_inode(ino);
 
-        reply.written(data.len() as u32);
+        reply.written(written as u32);
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -396,7 +572,9 @@ impl Filesystem for BWFS {
         let inode = &st.inodes[ino as usize];
 
         for b in inode.direct {
-            if b != 0 { st.free_block(b); }
+            if b != 0 {
+                st.free_block(b);
+            }
         }
 
         st.free_inode(ino);
@@ -429,17 +607,102 @@ impl Filesystem for BWFS {
         p2: u64,
         new: &OsStr,
         _flags: u32,
-        reply: ReplyEmpty
+        reply: ReplyEmpty,
     ) {
         let mut st = self.state.lock().unwrap();
         let ino = remove_dir_entry(&mut st, p1, name.to_str().unwrap());
-        write_dir_entry(&mut st, p2, DirEntry::new(ino, new.to_str().unwrap(), false));
+        write_dir_entry(
+            &mut st,
+            p2,
+            DirEntry::new(ino, new.to_str().unwrap(), false),
+        );
         reply.ok();
     }
 
-    fn access(&mut self, _req: &Request<'_>, _: u64, _: i32, reply: ReplyEmpty) { reply.ok() }
-    fn flush(&mut self, _req: &Request<'_>, _: u64, _: u64, _: u64, reply: ReplyEmpty) { reply.ok() }
-    fn fsync(&mut self, _req: &Request<'_>, _: u64, _: u64, _: bool, reply: ReplyEmpty) { reply.ok() }
-    fn lseek(&mut self, _req: &Request<'_>, _: u64, _: u64, _: i64, _: i32, reply: ReplyLseek) { reply.error(libc::ENOSYS) }
-    fn open(&mut self, _req: &Request<'_>, _: u64, _: i32, reply: ReplyOpen) { reply.opened(0, 0) }
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        println!("lookup(parent = {}, name = {:?})", parent, name);
+
+        let mut st = self.state.lock().unwrap();
+        let name_bytes = name.as_bytes();
+        let entry_size = std::mem::size_of::<DirEntry>();
+
+        // Validate parent inode
+        if parent as usize >= st.inodes.len() {
+            return reply.error(libc::ENOENT);
+        }
+        let parent_inode = &st.inodes[parent as usize];
+
+        // "." → the parent itself
+        if name_bytes == b"." {
+            let attr = BWFS::getattr_inode(parent, parent_inode);
+            return reply.entry(&TTL, &attr, 0);
+        }
+
+        // ".." → parent of root is root
+        if name_bytes == b".." && parent == 1 {
+            let inode = &st.inodes[1];
+            let attr = BWFS::getattr_inode(1, inode);
+            return reply.entry(&TTL, &attr, 0);
+        }
+
+        // Must be directory
+        if parent_inode.mode & 0o040000 == 0 {
+            return reply.error(libc::ENOTDIR);
+        }
+
+        // Load directory block
+        let blk = parent_inode.direct[0];
+        if blk == 0 {
+            return reply.error(libc::ENOENT);
+        }
+
+        let block_off = block_offset(&st.superblock, blk);
+        let mut buf = vec![0u8; st.superblock.block_size as usize];
+        st.file.seek(SeekFrom::Start(block_off)).unwrap();
+        st.file.read_exact(&mut buf).unwrap();
+
+        // SCAN REAL DIR ENTRIES — STOP AT FIRST FREE ENTRY
+        for chunk in buf.chunks_exact(entry_size) {
+            let d: DirEntry = unsafe { std::ptr::read(chunk.as_ptr() as *const _) };
+
+            if d.inode == 0 {
+                break; // IMPORTANT: rest of block is padding
+            }
+
+            let dname = &d.name[..d.name_len as usize];
+
+            if dname == name_bytes {
+                let ino = d.inode;
+                let inode = &st.inodes[ino as usize];
+                let attr = BWFS::getattr_inode(ino, inode);
+                return reply.entry(&TTL, &attr, 0);
+            }
+        }
+
+        reply.error(libc::ENOENT);
+    }
+
+    fn access(&mut self, _req: &Request<'_>, _: u64, _: i32, reply: ReplyEmpty) {
+        reply.ok()
+    }
+    fn flush(&mut self, _req: &Request<'_>, _: u64, _: u64, _: u64, reply: ReplyEmpty) {
+        reply.ok()
+    }
+    fn fsync(&mut self, _req: &Request<'_>, _: u64, _: u64, _: bool, reply: ReplyEmpty) {
+        reply.ok()
+    }
+    fn lseek(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        offset: i64,
+        _whence: i32,
+        reply: ReplyLseek,
+    ) {
+        reply.offset(offset);
+    }
+    fn open(&mut self, _req: &Request<'_>, _: u64, _: i32, reply: ReplyOpen) {
+        reply.opened(0, 0)
+    }
 }
