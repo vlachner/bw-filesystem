@@ -1,108 +1,54 @@
-//! Configuration loader for BWFS.
-//!
-//! This module loads and validates the `config.ini` file used by `mkfs.bwfs`.
-//! The configuration controls filesystem layout parameters,
-//! networking settings for distributed mode, and storage paths.
-//!
-//! The format expected is:
-//!
-//! ```ini
-//! [filesystem]
-//! name = my_bwfs
-//! block_size = 125000
-//! total_blocks = 200
-//! inode_count = 1000
-//!
-//! [network]
-//! listen_addr = 127.0.0.1
-//! listen_port = 8080
-//! peers = server1:9000, server2:9000
-//!
-//! [storage]
-//! data_dir = /tmp/bwfs_data
-//! image_prefix = bwfs_block
-//! fingerprint = BWFS_2024_V1
-//! ```
-//!
-//! All fields are mandatory except `network.peers`, which can be empty.
+/// Cargador de configuración para BWFS.
+/// Este módulo carga y valida el archivo `config.ini` usado por `mkfs.bwfs`.
+/// La configuración controla los parámetros de diseño del sistema de archivos, configuración de red para modo distribuido y rutas de almacenamiento.
+/// Todos los campos son obligatorios excepto `network.peers`, que puede estar vacío.
 
 use configparser::ini::Ini;
+/// Contiene todos los parámetros de configuración requeridos por mkfs.bwfs.
+/// Cada campo corresponde directamente a una clave dentro de `config.ini`, agrupadas en las secciones `[filesystem]`, `[network]` y `[storage]`.
+/// `mkfs.bwfs` usa estos valores para: determinar qué tan grande debe ser la imagen del sistema de archivos, asignar áreas de inodos y datos, embeber metadatos (nombre, fingerprint) en el superbloque, preparar metadatos de red para nodos BWFS distribuidos, determinar dónde guardar los archivos `.img` generados.
 
-/// Holds all configuration parameters required by mkfs.bwfs.
-///
-/// Each field corresponds directly to a key inside the `config.ini`,
-/// grouped across the `[filesystem]`, `[network]`, and `[storage]`
-/// sections.
-///
-/// `mkfs.bwfs` uses these values to:
-/// - determine how large the filesystem image should be
-/// - allocate inode and data areas
-/// - embed metadata (name, fingerprint) into the superblock
-/// - prepare networking metadata for distributed BWFS nodes
-/// - determine where to save the generated `.img` file(s)
 pub struct BwfsConfig {
-    /// Human-readable name of the filesystem.
+    /// Nombre legible del sistema de archivos.
     pub name: String,
 
-    /// Size of one block in bytes.
-    /// Example: for a 1000x1000 monochrome block - 125000 bytes.
+    /// Tamaño de un bloque en bytes. Ejemplo: para un bloque monocromático de 1000x1000 - 125000 bytes.
     pub block_size: u64,
 
-    /// Number of data blocks to create in the filesystem.
-    /// Total FS size = superblock + inode table + block_size * total_blocks.
+    /// Número de bloques de datos a crear en el sistema de archivos. Tamaño total del FS = superbloque + tabla de inodos + block_size * total_blocks.
     pub total_blocks: u64,
 
-    /// Number of inodes reserved in the inode table.
+    /// Número de inodos reservados en la tabla de inodos.
     pub inode_count: u64,
 
-    /// Address on which this node will listen for distributed BWFS commands.
+    /// Dirección en la que este nodo escuchará comandos BWFS distribuidos.
     pub listen_addr: String,
 
-    /// Port for the listener.
+    /// Puerto para el listener..
     pub listen_port: u16,
-
-    /// Optional list of peers participating in distributed BWFS mode.
-    /// Example: ["10.0.0.1:9000", "10.0.0.2:9000"]
+    
+    /// Lista opcional de peers participando en modo BWFS distribuido. Ejemplo: ["10.0.0.1:9000", "10.0.0.2:9000"]
     pub peers: Vec<String>,
 
-    /// Directory where the filesystem image will be stored.
+    /// Directorio donde se almacenará la imagen del sistema de archivos.
     pub data_dir: String,
 
-    /// Prefix used when naming image files.
-    /// Example: "bwfs_block" → "bwfs_block.img"
+    /// Prefijo usado al nombrar archivos de imagen. Ejemplo: "bwfs_block" → "bwfs_block.img"
     pub image_prefix: String,
 
-    /// Filesystem fingerprint stored in the superblock.
-    /// Used later by the mounter to identify the FS.
+    /// Fingerprint del sistema de archivos almacenado en el superbloque. Usado posteriormente por el montador para identificar el FS.
     pub fingerprint: String,
 }
 
-/// Load and parse the BWFS configuration from `config.ini`.
-///
-/// # Behavior
-///
-/// - Loads the INI file.
-/// - Extracts keys from the `[filesystem]`, `[network]`, and `[storage]` sections.
-/// - Converts numeric fields to `u64` or `u16`.
-/// - Validates that required fields exist.
-/// - Splits `network.peers` into a list.
-///
-/// # Panics
-///
-/// This function will `panic!()` with a descriptive message if:
-///
-/// - a required field is missing
-/// - a numeric field cannot be parsed
-/// - the configuration file cannot be loaded
-///
-/// This is acceptable because `mkfs.bwfs` should fail fast on bad configuration.
+/// Carga y parsea la configuración BWFS desde `config.ini`.
+/// Carga el archivo INI, extrae claves de las secciones `[filesystem]`, `[network]` y `[storage]`, convierte campos numéricos a `u64` o `u16`, valida que los campos requeridos existan y divide `network.peers` en una lista.
+/// Esta función hará `panic!()` con un mensaje descriptivo si: falta un campo requerido, un campo numérico no puede ser parseado, o el archivo de configuración no puede ser cargado.
+/// Esto es aceptable porque `mkfs.bwfs` debe fallar rápidamente ante una mala configuración.
 pub fn load_config(path: &str) -> BwfsConfig {
     let mut ini = Ini::new();
     ini.load(path).expect("Could not load config.ini");
 
-    // -------------------------
-    // [filesystem] section
-    // -------------------------
+    /// Sección [filesystem]
     let name = ini
         .get("filesystem", "name")
         .expect("missing filesystem.name");
@@ -122,9 +68,7 @@ pub fn load_config(path: &str) -> BwfsConfig {
         .expect("missing filesystem.inode_count")
         .expect("invalid filesystem.inode_count") as u64;
 
-    // -------------------------
-    // [network] section
-    // -------------------------
+    /// Sección [network]
     let listen_addr = ini
         .get("network", "listen_addr")
         .expect("missing network.listen_addr");
@@ -134,13 +78,11 @@ pub fn load_config(path: &str) -> BwfsConfig {
         .expect("missing network.listen_port")
         .expect("invalid network.listen_port") as u16;
 
-    // `peers` is optional: empty string → empty vector
+    /// `peers` es opcional: string vacío → vector vacío
     let peers_raw = ini.get("network", "peers").unwrap_or_default();
     let peers = parse_list(&peers_raw);
 
-    // -------------------------
-    // [storage] section
-    // -------------------------
+    /// Sección [storage]
     let data_dir = ini
         .get("storage", "data_dir")
         .expect("missing storage.data_dir");
@@ -167,13 +109,7 @@ pub fn load_config(path: &str) -> BwfsConfig {
     }
 }
 
-/// Parse a comma-separated list such as:
-///
-/// `"node1:9000, node2:9000"`
-///
-/// into:
-///
-/// `["node1:9000", "node2:9000"]`
+/// Parsea una lista separada por comas como: `"node1:9000, node2:9000"` en: `["node1:9000", "node2:9000"]`
 fn parse_list(s: &str) -> Vec<String> {
     s.split(',')
         .map(|v| v.trim().to_string())
